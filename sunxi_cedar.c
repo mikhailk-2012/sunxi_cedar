@@ -35,23 +35,37 @@
 #include <linux/sched.h>
 #include <linux/kthread.h>
 #include <linux/delay.h>
-#include <linux/dma-mapping.h>
-#include <linux/of_reserved_mem.h>
-#include <linux/reset.h>
-#include <linux/mfd/syscon.h>
-#include <linux/regmap.h>
+#include <linux/version.h>
 #include <asm/uaccess.h>
 #include <asm/io.h>
-#include <linux/io.h>
 #include <asm/dma.h>
-//#include <mach/hardware.h>
-//#include <asm/system.h>
+#include <linux/dma-mapping.h>
+#include <linux/mm.h>
 #include <asm/siginfo.h>
 #include <asm/signal.h>
-//#include <mach/system.h>
-//#include <mach/clock.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,11,0)
+#include <linux/reset.h>
+#include <linux/sched/signal.h>
+#include <linux/mfd/syscon.h>
+#include <linux/regmap.h>
+#else /*LINUX_VERSION_CODE >= KERNEL_VERSION(4,11,0)*/
+#include <linux/clk/sunxi.h>
+#endif /*LINUX_VERSION_CODE < KERNEL_VERSION(4,11,0)*/
+
+#include <linux/of.h>
+#include <linux/of_address.h>
+#include <linux/of_irq.h>
+
 #include "sunxi_cedar.h"
 #include "cedar_extra.h"
+#include <linux/regulator/consumer.h>
+#include <linux/of_reserved_mem.h>
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,0,0)
+#include <linux/soc/sunxi/sunxi_sram.h>
+#endif
+
+#define HAVE_TIMER_SETUP
 
 #define DRV_VERSION "0.01alpha"
 
@@ -64,7 +78,7 @@
 #define CEDARDEV_MINOR (0)
 #endif
 
-//#define CEDAR_DEBUG
+#define CEDAR_DEBUG
 
 #define CONFIG_SW_SYSMEM_RESERVED_BASE 0x43000000
 #define CONFIG_SW_SYSMEM_RESERVED_SIZE 75776
@@ -386,7 +400,11 @@ int cedardev_check_delay(int check_prio)
 	return timeout_total;
 }
 
+#ifdef HAVE_TIMER_SETUP
+static void cedar_engine_for_timer_rel(struct timer_list *t)
+#else
 static void cedar_engine_for_timer_rel(unsigned long arg)
+#endif
 {
 	unsigned long flags;
 
@@ -402,10 +420,18 @@ static void cedar_engine_for_timer_rel(unsigned long arg)
 	spin_unlock_irqrestore(&cedar_spin_lock, flags);
 }
 
+#ifdef HAVE_TIMER_SETUP
+static void cedar_engine_for_events(struct timer_list *t)
+#else
 static void cedar_engine_for_events(unsigned long arg)
+#endif
 {
 	struct cedarv_engine_task *task_entry, *task_entry_tmp;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,19,0)
+	struct kernel_siginfo info;
+#else
 	struct siginfo info;
+#endif
 	unsigned long flags;
 
 	spin_lock_irqsave(&cedar_spin_lock, flags);
@@ -799,6 +825,7 @@ long cedardev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				return -EFAULT;
 			}
 			flush_clean_user_range(cache_range.start, cache_range.end);
+
         }
         break;
 
@@ -894,7 +921,7 @@ static int cedardev_mmap(struct file *filp, struct vm_area_struct *vma)
         vma->vm_flags |= VM_RESERVED | VM_IO;
 
         /* Select uncached access. */
-        //vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+	//vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
 
         if (remap_pfn_range(vma, vma->vm_start, temp_pfn,
                             vma->vm_end - vma->vm_start, vma->vm_page_prot)) {
@@ -911,6 +938,10 @@ static int cedardev_mmap(struct file *filp, struct vm_area_struct *vma)
             return -EAGAIN;
         }
     }
+/*
+printk(KERN_INFO "[%s] io_ram=%d vm_start=0x%x  vm_size=0x%x\n", __FUNCTION__,
+	io_ram, vma->vm_start, vma->vm_end - vma->vm_start);
+*/
 
     vma->vm_ops = &cedardev_remap_vm_ops;
     cedardev_vma_open(vma);
@@ -952,7 +983,7 @@ int sunxi_cedrus_hw_probe(struct cedar_dev *vpu)
 	struct resource *res;
 	int irq_dec;
 	int ret;
-    struct clk *pll;
+	struct clk *pll;
 
 	irq_dec = platform_get_irq(vpu->pdev, 0);
 	if (irq_dec <= 0) {
@@ -965,7 +996,7 @@ int sunxi_cedrus_hw_probe(struct cedar_dev *vpu)
 		dev_err(vpu->dev, "could not request ve IRQ\n");
 		return -ENXIO;
 	}
-  vpu->irq = irq_dec;
+	vpu->irq = irq_dec;
 
 	ret = of_reserved_mem_device_init(vpu->dev);
 	if (ret) {
@@ -1039,7 +1070,7 @@ static int cedardev_probe(struct platform_device *pdev)
   }
 
 	/* If having CMA enabled, just rely on CMA for memory allocation */
-	ve_size = 64 * SZ_1M;
+	ve_size = 80 * SZ_1M;
 	ve_start_virt = dma_alloc_coherent(&pdev->dev, ve_size, &pa,
 							GFP_KERNEL | GFP_DMA);
 	if (!ve_start_virt) {
@@ -1151,8 +1182,14 @@ static int cedardev_probe(struct platform_device *pdev)
 	/*在cedar drv初始化的时候，初始化定时器并设置它的成员
 	* 在有任务插入run_task_list的时候，启动定时器，并设置定时器的时钟为当前系统的jiffies，参考cedardev_insert_task
 	*/
-    setup_timer(&cedar_devp->cedar_engine_timer, cedar_engine_for_events, (unsigned long)cedar_devp);
-	setup_timer(&cedar_devp->cedar_engine_timer_rel, cedar_engine_for_timer_rel, (unsigned long)cedar_devp);
+#ifdef HAVE_TIMER_SETUP
+	timer_setup(&cedar_devp->cedar_engine_timer, &cedar_engine_for_events, 0);
+	timer_setup(&cedar_devp->cedar_engine_timer_rel, &cedar_engine_for_timer_rel, 0);
+#else
+	setup_timer(&cedar_devp->cedar_engine_timer, cedar_engine_for_events, (ulong)cedar_devp);
+	setup_timer(&cedar_devp->cedar_engine_timer_rel, cedar_engine_for_timer_rel, (ulong)cedar_devp);
+#endif
+
 	printk("[cedar dev]: install end!!!\n");
 	return 0;
 }
@@ -1170,22 +1207,8 @@ static int cedardev_remove(struct platform_device *pdev) {
 		device_destroy(cedar_devp->class, dev);
 		class_destroy(cedar_devp->class);
 	}
-#if 0
-	clk_disable(dram_veclk);
-	clk_put(dram_veclk);
 
-	clk_disable(ve_moduleclk);
-	clk_put(ve_moduleclk);
-
-	clk_disable(ahb_veclk);
-	clk_put(ahb_veclk);
-
-	clk_put(ve_pll4clk);
-
-	clk_disable(avs_moduleclk);
-	clk_put(avs_moduleclk);
-#endif
-    disable_cedar_hw_clk();
+	disable_cedar_hw_clk();
 
 	if (ve_start_virt) {
 		dma_free_coherent(&pdev->dev, ve_size, ve_start_virt, ve_start);

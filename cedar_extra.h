@@ -20,7 +20,7 @@
 #endif
 
 #ifndef SW_PA_SDRAM_START
-#define SW_PA_SDRAM_START                 0x40000000
+#define SW_PA_SDRAM_START                 0x4a000000
 #endif
 
 #endif
